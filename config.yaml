@@ -1,0 +1,37 @@
+# ---- paths ----
+paths:
+  train_dir: dataset/train
+  test_dir: dataset/test
+  output_dir: output
+  cache_dir: cache
+  model_path: cache/model.pkl
+
+# ---- blocking ----
+blocking:
+  rare_token_df_min: 2          # inverted index: only index tokens with df >= this
+  rare_token_df_max: 200        # ... and <= this (drop ultra-common tokens)
+  char_ngram_n: 3
+  minhash_threshold: 0.5        # LSH Jaccard threshold
+  addr_token_df_max: 300
+  use_lsh: true                 # set false if datasketch is unavailable
+
+# ---- model ----
+model:
+  n_estimators: 3000
+  learning_rate: 0.03
+  num_leaves: 63
+  min_child_samples: 40
+  subsample: 0.9
+  colsample_bytree: 0.9
+  reg_lambda: 1.0
+  n_folds: 5                    # GroupKFold by s1_id
+  calibrate: true
+
+# ---- F0.5 decision ----
+decision:
+  t_open_grid: [0.30, 0.94, 0.02]   # start, stop (incl), step
+  t_add_grid:  [0.20, 0.94, 0.02]
+  greedy_per_entity: true
+  max_matches: 0                    # 0 = unlimited; set 1..3 if EDA says many-to-one
+
+team_name: myteam
