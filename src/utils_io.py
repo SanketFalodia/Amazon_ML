@@ -8,19 +8,42 @@ COLS = ["entity_id", "business_name", "business_address", "country"]
 
 def read_tsv(path: str) -> pd.DataFrame:
     # CRITICAL: always use an explicit tab separator.
-    return pd.read_csv(path, sep="\t", dtype=str).fillna("")
+    df = pd.read_csv(path, sep="\t", dtype="string").fillna("")
+    missing = [col for col in COLS if col not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{path} is missing required columns: {', '.join(missing)}. "
+            f"Expected: {', '.join(COLS)}"
+        )
+    return df[COLS]
 
 
-def read_sources(dirpath: str, split: str):
+def read_sources(dirpath: str, split: str, filenames: list[str] | None = None):
     """split in {'train','test'} -> (s1, s2, s3)."""
-    s1 = read_tsv(os.path.join(dirpath, f"{split}_source1.tsv"))
-    s2 = read_tsv(os.path.join(dirpath, f"{split}_source2.tsv"))
-    s3 = read_tsv(os.path.join(dirpath, f"{split}_source3.tsv"))
+    filenames = filenames or [f"{split}_source{i}.tsv" for i in range(1, 4)]
+    if len(filenames) != 3:
+        raise ValueError(f"{split}_sources must contain exactly three TSV filenames")
+    paths = [os.path.join(dirpath, filename) for filename in filenames]
+    missing = [path for path in paths if not os.path.isfile(path)]
+    if missing:
+        expected = "\n".join(f"  - {path}" for path in paths)
+        raise FileNotFoundError(
+            f"Missing {split} source file(s): {', '.join(missing)}\n"
+            f"Expected these three files:\n{expected}"
+        )
+    s1, s2, s3 = (read_tsv(path) for path in paths)
     return s1, s2, s3
 
 
 def read_ground_truth(path: str) -> dict[str, list[str]]:
-    gt = read_tsv(path)
+    gt = pd.read_csv(path, sep="\t", dtype="string").fillna("")
+    required = ["source1_entity_id", "matched_entity_ids"]
+    missing = [col for col in required if col not in gt.columns]
+    if missing:
+        raise ValueError(
+            f"{path} is missing ground-truth columns: {', '.join(missing)}. "
+            f"Expected: {', '.join(required)}"
+        )
     out: dict[str, list[str]] = {}
     for _, r in gt.iterrows():
         ids = [x for x in str(r["matched_entity_ids"]).split(",") if x.strip()]

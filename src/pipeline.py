@@ -31,8 +31,7 @@ def _cache(cfg, name):
 def stage_prep(cfg):
     tr = cfg["paths"]["train_dir"]
     te = cfg["paths"]["test_dir"]
-    s1, s2, s3 = io.read_sources(tr, "train")
-    t1, t2, t3 = io.read_sources(te, "test")
+    s1, s2, s3 = io.read_sources(tr, "train", cfg["paths"].get("train_sources"))
     gt = io.read_ground_truth(os.path.join(tr, "train_ground_truth.tsv"))
 
     all_s1 = list(s1["entity_id"])
@@ -49,13 +48,18 @@ def stage_prep(cfg):
     print(f"[prep] repeated S2/S3 ids in ground truth = {dup} "
           f"({'many-to-one, uniqueness OK' if dup == 0 else 'NOT one-to-one'})")
     print("[prep] train countries:", s1["country"].value_counts().to_dict())
-    print("[prep] test  countries:", t1["country"].value_counts().to_dict())
 
-    s1n, s2n, s3n = nz.normalize_frame(s1), nz.normalize_frame(s2), nz.normalize_frame(s3)
-    t1n, t2n, t3n = nz.normalize_frame(t1), nz.normalize_frame(t2), nz.normalize_frame(t3)
-    for df, path in ((s1n, "train_s1"), (s2n, "train_s2"), (s3n, "train_s3"),
-                     (t1n, "test_s1"), (t2n, "test_s2"), (t3n, "test_s3")):
-        df.to_parquet(_cache(cfg, f"{path}.parquet"))
+    for raw, name in ((s1, "train_s1"), (s2, "train_s2"), (s3, "train_s3")):
+        nz.normalize_frame(raw).to_parquet(_cache(cfg, f"{name}.parquet"))
+
+    del s1, s2, s3
+
+    t1, t2, t3 = io.read_sources(te, "test", cfg["paths"].get("test_sources"))
+    print("[prep] test  countries:", t1["country"].value_counts().to_dict())
+    for raw, name in ((t1, "test_s1"), (t2, "test_s2"), (t3, "test_s3")):
+        nz.normalize_frame(raw).to_parquet(_cache(cfg, f"{name}.parquet"))
+
+    del t1, t2, t3
     json.dump(gt, open(_cache(cfg, "ground_truth.json"), "w"))
     print("[prep] done")
 
@@ -162,7 +166,9 @@ def stage_validate(cfg):
     except FileNotFoundError:
         print("[validate] utils/validate_submission.py not found; running self-check instead")
 
-    te1, te2, te3 = io.read_sources(cfg["paths"]["test_dir"], "test")
+    te1, te2, te3 = io.read_sources(
+        cfg["paths"]["test_dir"], "test", cfg["paths"].get("test_sources")
+    )
     match = _read_out(os.path.join(out, "matching_results.tsv"), "matched_entity_ids")
     cand = _read_out(os.path.join(out, "candidate_pairs.tsv"), "candidate_entity_ids")
     problems = io.self_check(match, cand, te1, te2, te3)

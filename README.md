@@ -22,11 +22,22 @@ dataset/
 │   ├── train_source3.tsv
 │   └── train_ground_truth.tsv
 └── test/
-    ├── test_source1.tsv
-    ├── test_source2.tsv
-    └── test_source3.tsv
+  ├── test_source1.tsv
+  ├── test_source2.tsv
+  └── test_source3.tsv
 utils/validate_submission.py        # provided by the organizers
 ```
+
+Each of the six source TSV files must be tab-separated and contain these columns:
+
+```text
+entity_id	business_name	business_address	country
+```
+
+For your three test files, place them in `dataset/test/` in this order: source 1 is
+the S1 query table, while sources 2 and 3 are the candidate entity tables. If your
+filenames differ, update `paths.test_sources` in `config.yaml`; it must contain
+exactly three filenames.
 
 ## 3. Run everything
 
