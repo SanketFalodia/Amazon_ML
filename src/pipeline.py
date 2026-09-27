@@ -40,7 +40,6 @@ def stage_prep(cfg):
     print(f"[prep] singleton fraction f={n_single/len(all_s1):.3f}  "
           f"(all-empty baseline macro-F0.5 ~= f)")
 
-    # cardinality / uniqueness diagnostics
     counts = pd.Series([len(v) for v in gt.values()])
     print("[prep] match-count distribution:\n", counts.value_counts().sort_index().to_string())
     flat = [i for v in gt.values() for i in v]
@@ -49,17 +48,28 @@ def stage_prep(cfg):
           f"({'many-to-one, uniqueness OK' if dup == 0 else 'NOT one-to-one'})")
     print("[prep] train countries:", s1["country"].value_counts().to_dict())
 
-    for raw, name in ((s1, "train_s1"), (s2, "train_s2"), (s3, "train_s3")):
-        nz.normalize_frame(raw).to_parquet(_cache(cfg, f"{name}.parquet"))
-
-    del s1, s2, s3
+    chunk = cfg["paths"].get("normalize_chunk_size", 100_000)
+    print(f"[prep] normalizing train_s1 ({len(s1)} rows, chunk={chunk}) ...")
+    nz.normalize_frame_to_parquet(s1, _cache(cfg, "train_s1.parquet"), chunk_size=chunk)
+    del s1
+    print(f"[prep] normalizing train_s2 ({len(s2)} rows, chunk={chunk}) ...")
+    nz.normalize_frame_to_parquet(s2, _cache(cfg, "train_s2.parquet"), chunk_size=chunk)
+    del s2
+    print(f"[prep] normalizing train_s3 ({len(s3)} rows, chunk={chunk}) ...")
+    nz.normalize_frame_to_parquet(s3, _cache(cfg, "train_s3.parquet"), chunk_size=chunk)
+    del s3
 
     t1, t2, t3 = io.read_sources(te, "test", cfg["paths"].get("test_sources"))
     print("[prep] test  countries:", t1["country"].value_counts().to_dict())
-    for raw, name in ((t1, "test_s1"), (t2, "test_s2"), (t3, "test_s3")):
-        nz.normalize_frame(raw).to_parquet(_cache(cfg, f"{name}.parquet"))
-
-    del t1, t2, t3
+    print(f"[prep] normalizing test_s1 ({len(t1)} rows, chunk={chunk}) ...")
+    nz.normalize_frame_to_parquet(t1, _cache(cfg, "test_s1.parquet"), chunk_size=chunk)
+    del t1
+    print(f"[prep] normalizing test_s2 ({len(t2)} rows, chunk={chunk}) ...")
+    nz.normalize_frame_to_parquet(t2, _cache(cfg, "test_s2.parquet"), chunk_size=chunk)
+    del t2
+    print(f"[prep] normalizing test_s3 ({len(t3)} rows, chunk={chunk}) ...")
+    nz.normalize_frame_to_parquet(t3, _cache(cfg, "test_s3.parquet"), chunk_size=chunk)
+    del t3
     json.dump(gt, open(_cache(cfg, "ground_truth.json"), "w"))
     print("[prep] done")
 
@@ -115,9 +125,8 @@ def stage_train(cfg):
     for tr_idx, va_idx in gkf.split(X, y, groups):
         clf = tm.train(cfg, X.iloc[tr_idx], y[tr_idx], groups[tr_idx])
         oof[va_idx] = clf.predict_proba(X.iloc[va_idx])[:, 1]
-    clf = tm.train(cfg, X, y, groups)                # final model on all data
+    clf = tm.train(cfg, X, y, groups)
     tm.save_model(clf, cfg["paths"]["model_path"])
-    # tune thresholds on OOF predictions
     scored = _oof_scored(meta, oof)
     all_s1 = list(pd.unique(groups))
     gt = json.load(open(_cache(cfg, "ground_truth.json")))
@@ -148,7 +157,7 @@ def stage_predict(cfg):
     scored = pr.score_pairs(te1, by_id, cands, clf, name_mat, addr_mat, idx)
     mm = cfg["decision"].get("max_matches", 0)
     rows = {s1: pr.greedy_pick(sc, thr["t_open"], thr["t_add"], mm) for s1, sc in scored.items()}
-    for s1 in te1["entity_id"]:                      # ensure every S1 present
+    for s1 in te1["entity_id"]:
         rows.setdefault(s1, [])
     io.write_results(os.path.join(cfg["paths"]["output_dir"], "matching_results.tsv"), rows)
     print(f"[predict] wrote matching_results.tsv  (t_open={thr['t_open']}, t_add={thr['t_add']})")

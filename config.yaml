@@ -7,6 +7,7 @@ paths:
   output_dir: output
   cache_dir: cache
   model_path: cache/model.pkl
+  normalize_chunk_size: 100000   # NEW: rows/chunk during normalize -- bounds peak memory
 
 # ---- blocking ----
 blocking:
@@ -16,6 +17,8 @@ blocking:
   minhash_threshold: 0.5        # LSH Jaccard threshold
   addr_token_df_max: 300
   use_lsh: true                 # set false if datasketch is unavailable
+  loc_token_df_max: 500         # NEW: caps cs:/nfirst:/nfirst2:/meta:/init: (previously uncapped)
+  n_jobs: 4                     # NEW: worker processes for blocking + pair-feature loops
 
 # ---- model ----
 model:

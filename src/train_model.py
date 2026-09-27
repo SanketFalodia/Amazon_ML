@@ -1,6 +1,15 @@
-"""Train + calibrate LightGBM on blocking candidates labelled by ground truth."""
+"""Train + calibrate LightGBM on blocking candidates labelled by ground truth.
+
+Optimized vs original:
+  1. iterrows()/.loc[] -> plain dicts. Series-level indexing (by_id.loc[cid]) is
+     slow one-row-at-a-time; a dict keyed by entity_id is O(1) attribute-style access.
+  2. The per-S1-row loop (which drives every pair_features() call -- your actual
+     hot path, since it runs ~9 rapidfuzz comparisons + 2 sparse dot products per
+     candidate) is split across cfg["n_jobs"] processes via fork, so all cores get used.
+"""
 from __future__ import annotations
 import os
+from multiprocessing import get_context
 
 import numpy as np
 import pandas as pd
@@ -10,20 +19,69 @@ from sklearn.calibration import CalibratedClassifierCV
 from .features import pair_features, feature_columns
 
 
-def build_training_pairs(s1n, s2n, s3n, cands, truth, name_mat, addr_mat, idx):
-    by_id = pd.concat([s2n, s3n]).set_index("entity_id", drop=False)
+def _ctx():
+    try:
+        return get_context("fork")
+    except ValueError:
+        return get_context()
+
+
+_G: dict = {}
+
+
+def _pool_init(by_id, cands, truth, name_mat, addr_mat, idx):
+    _G["by_id"], _G["cands"], _G["truth"] = by_id, cands, truth
+    _G["name_mat"], _G["addr_mat"], _G["idx"] = name_mat, addr_mat, idx
+
+
+def _pairs_for_chunk(s1_records: list[dict]):
+    by_id, cands, truth = _G["by_id"], _G["cands"], _G["truth"]
+    name_mat, addr_mat, idx = _G["name_mat"], _G["addr_mat"], _G["idx"]
     X, y, groups, meta = [], [], [], []
-    for _, a in s1n.iterrows():
+    for a in s1_records:
         s1 = a["entity_id"]
         tset = set(truth.get(s1, []))
         for cid in cands.get(s1, []):
-            if cid not in by_id.index:
+            b = by_id.get(cid)
+            if b is None:
                 continue
-            b = by_id.loc[cid]
             X.append(pair_features(a, b, name_mat, addr_mat, idx))
             y.append(1 if cid in tset else 0)
             groups.append(s1)
             meta.append((s1, cid))
+    return X, y, groups, meta
+
+
+def _chunks(lst: list, n: int):
+    size = max(1, -(-len(lst) // n))
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
+def build_training_pairs(s1n, s2n, s3n, cands, truth, name_mat, addr_mat, idx, n_jobs=None):
+    by_id_df = pd.concat([s2n, s3n], ignore_index=True)
+    by_id = {r["entity_id"]: r for r in by_id_df.to_dict("records")}
+    s1_records = s1n.to_dict("records")
+
+    n_jobs = n_jobs or os.cpu_count() or 1
+    ctx = _ctx()
+
+    if n_jobs > 1 and len(s1_records) > 2000:
+        chunks = list(_chunks(s1_records, n_jobs))
+        with ctx.Pool(n_jobs, initializer=_pool_init,
+                       initargs=(by_id, cands, truth, name_mat, addr_mat, idx)) as pool:
+            parts = pool.map(_pairs_for_chunk, chunks)
+    else:
+        _pool_init(by_id, cands, truth, name_mat, addr_mat, idx)
+        parts = [_pairs_for_chunk(s1_records)]
+
+    X, y, groups, meta = [], [], [], []
+    for px, py, pg, pm in parts:
+        X.extend(px)
+        y.extend(py)
+        groups.extend(pg)
+        meta.extend(pm)
+
     Xdf = pd.DataFrame(X)[feature_columns()]
     return Xdf, np.array(y), np.array(groups), meta
 
