@@ -1,6 +1,6 @@
 """Recall-first candidate generation via a UNION of cheap, complementary blocking keys.
 
-Two-pass construction (fixes the OOM you hit at "[block] building train
+Two-pass construction (fixes the OOM at "[block] building train
 candidates (2206821 x 10320219)"):
 
   Pass 1 counts each key's GLOBAL document frequency across the whole
@@ -9,23 +9,20 @@ candidates (2206821 x 10320219)"):
 
   Pass 2 builds the actual inverted index, but only inserts a row's id
   under a key if that key's global df is within [df_min, df_max] for its
-  type. Keys that are too rare (a typo-only token, df < rare_token_df_min)
-  or too common (df > *_df_max -- a generic 3-gram/word that shows up in a
-  huge fraction of a 10M+ row corpus) are never turned into an id list.
+  type. Keys that are too rare or too common are never turned into an id list.
 
-  Why this was the crash: the previous version applied the df cap only at
-  LOOKUP time. Every key -- including "mega" keys like common 3-grams
-  ("ind", "com", "pvt"...) that appear in a large fraction of a 10M+ row
-  table -- was still fully materialized as a list of entity ids during the
-  SCAN pass, then thrown away later. A handful of such keys, each holding
-  millions of ids, is enough on its own to exhaust Kaggle's RAM before the
-  cap is ever consulted. Moving the cap to build time means no list this
-  module ever holds can exceed its configured df_max -- memory is bounded
-  by (number of surviving keys) x (max cap), not by corpus size.
+NEW in this version: `others` is accepted as a DataFrame OR a list/tuple of
+DataFrames (e.g. [s2n, s3n]) and is NEVER internally concatenated. The actual
+remaining OOM trigger was not inside this module -- it was pd.concat([s2n, s3n])
+being called in pipeline.py *before* build_candidates() was even invoked.
+pd.concat() on two multi-million-row frames briefly holds both source frames
+AND the new combined result simultaneously (until the sources are garbage
+collected), which is enough on its own to exhaust 30GB at this scale. Accepting
+a list and iterating each frame's own chunks sidesteps that spike entirely.
 
-  Everything else (chunked itertuples() streaming, fork-based Pool sharing
-  the source DataFrame via copy-on-write, per-key-type caps) is unchanged
-  from the previous version.
+Everything else (chunked itertuples() streaming, fork-based Pool sharing each
+source DataFrame via copy-on-write, per-key-type caps, the two-pass count/cap
+logic) is unchanged.
 """
 from __future__ import annotations
 from collections import defaultdict, Counter
@@ -44,6 +41,17 @@ def _ctx():
 def _chunks_idx(n: int, size: int):
     for i in range(0, n, size):
         yield (i, min(i + size, n))
+
+
+def _multi_ranges(dfs: list[pd.DataFrame], chunk_size: int) -> list[tuple[int, int, int]]:
+    """(df_index, start, end) ranges spanning every frame in dfs, so a single
+    Pool.imap_unordered call can chunk-process all of them without ever
+    concatenating them first."""
+    ranges = []
+    for i, df in enumerate(dfs):
+        for start, end in _chunks_idx(len(df), chunk_size):
+            ranges.append((i, start, end))
+    return ranges
 
 
 def _keys_row(row, cfg: dict) -> set[str]:
@@ -87,36 +95,36 @@ def _bounds_for(k: str, cfg: dict) -> tuple[int, int | None]:
     return 0, None  # pin:/zip: stay uncapped -- exact numeric match, rarely a mega-block
 
 
-_G_DF = None
+_G_DFS = None   # list/tuple of DataFrames, indexed by df_idx -- never concatenated
 _G_CFG = None
 _G_KEEP = None
 _G_INV = None
 
 
-def _pool_init_count(df, cfg):
-    global _G_DF, _G_CFG
-    _G_DF, _G_CFG = df, cfg
+def _pool_init_count(dfs, cfg):
+    global _G_DFS, _G_CFG
+    _G_DFS, _G_CFG = dfs, cfg
 
 
-def _count_range(rng: tuple[int, int]) -> dict[str, int]:
-    start, end = rng
-    df, cfg = _G_DF, _G_CFG
+def _count_range(rng: tuple[int, int, int]) -> dict[str, int]:
+    df_idx, start, end = rng
+    dfs, cfg = _G_DFS, _G_CFG
     counts: Counter = Counter()
-    for row in df.iloc[start:end].itertuples(index=False):
+    for row in dfs[df_idx].iloc[start:end].itertuples(index=False):
         counts.update(_keys_row(row, cfg))
     return counts
 
 
-def _pool_init_scan(df, cfg, keep):
-    global _G_DF, _G_CFG, _G_KEEP
-    _G_DF, _G_CFG, _G_KEEP = df, cfg, keep
+def _pool_init_scan(dfs, cfg, keep):
+    global _G_DFS, _G_CFG, _G_KEEP
+    _G_DFS, _G_CFG, _G_KEEP = dfs, cfg, keep
 
 
-def _scan_range(rng: tuple[int, int]) -> dict[str, list[str]]:
-    start, end = rng
-    df, cfg, keep = _G_DF, _G_CFG, _G_KEEP
+def _scan_range(rng: tuple[int, int, int]) -> dict[str, list[str]]:
+    df_idx, start, end = rng
+    dfs, cfg, keep = _G_DFS, _G_CFG, _G_KEEP
     inv: dict[str, list[str]] = defaultdict(list)
-    for row in df.iloc[start:end].itertuples(index=False):
+    for row in dfs[df_idx].iloc[start:end].itertuples(index=False):
         for k in _keys_row(row, cfg):
             if k in keep:
                 inv[k].append(row.entity_id)
@@ -124,13 +132,13 @@ def _scan_range(rng: tuple[int, int]) -> dict[str, list[str]]:
 
 
 def _pool_init_lookup(inv, cfg, df):
-    global _G_INV, _G_CFG, _G_DF
-    _G_INV, _G_CFG, _G_DF = inv, cfg, df
+    global _G_INV, _G_CFG, _G_DFS
+    _G_INV, _G_CFG, _G_DFS = inv, cfg, (df,)
 
 
-def _lookup_range(rng: tuple[int, int]) -> dict[str, list[str]]:
-    start, end = rng
-    inv, cfg, df = _G_INV, _G_CFG, _G_DF
+def _lookup_range(rng: tuple[int, int, int]) -> dict[str, list[str]]:
+    _, start, end = rng
+    inv, cfg, df = _G_INV, _G_CFG, _G_DFS[0]
     out: dict[str, list[str]] = {}
     for row in df.iloc[start:end].itertuples(index=False):
         see: set[str] = set()
@@ -142,61 +150,66 @@ def _lookup_range(rng: tuple[int, int]) -> dict[str, list[str]]:
     return out
 
 
-def _build_df_counts(others: pd.DataFrame, cfg: dict, n_jobs: int, chunk_size: int, ctx) -> Counter:
-    n_other = len(others)
+def _build_df_counts(dfs: list[pd.DataFrame], cfg: dict, n_jobs: int,
+                      chunk_size: int, ctx) -> Counter:
     counts: Counter = Counter()
-    if n_jobs > 1 and n_other > chunk_size:
-        ranges = list(_chunks_idx(n_other, chunk_size))
-        with ctx.Pool(n_jobs, initializer=_pool_init_count, initargs=(others, cfg)) as pool:
+    total = sum(len(df) for df in dfs)
+    if n_jobs > 1 and total > chunk_size:
+        ranges = _multi_ranges(dfs, chunk_size)
+        with ctx.Pool(n_jobs, initializer=_pool_init_count, initargs=(dfs, cfg)) as pool:
             for part in pool.imap_unordered(_count_range, ranges):
                 counts.update(part)
                 del part
     else:
-        for row in others.itertuples(index=False):
-            counts.update(_keys_row(row, cfg))
+        for df in dfs:
+            for row in df.itertuples(index=False):
+                counts.update(_keys_row(row, cfg))
     return counts
 
 
-def build_candidates(s1n: pd.DataFrame, others: pd.DataFrame, cfg: dict) -> dict[str, list[str]]:
-    """others = concatenated+normalized S2 & S3. Returns s1_id -> [ids]."""
+def build_candidates(s1n: pd.DataFrame, others, cfg: dict) -> dict[str, list[str]]:
+    """others: a DataFrame OR a list/tuple of DataFrames (e.g. [s2n, s3n]).
+    NEVER internally concatenated. Returns s1_id -> [ids]."""
+    dfs = list(others) if isinstance(others, (list, tuple)) else [others]
+
     n_jobs = cfg.get("n_jobs") or os.cpu_count() or 1
     chunk_size = cfg.get("chunk_size", 200_000)
     ctx = _ctx()
 
     # --- Pass 1: global df per key -- counts only, no id lists -> small memory. ---
-    df_counts = _build_df_counts(others, cfg, n_jobs, chunk_size, ctx)
+    df_counts = _build_df_counts(dfs, cfg, n_jobs, chunk_size, ctx)
     keep = {
         k for k, c in df_counts.items()
         if c >= _bounds_for(k, cfg)[0]
         and (_bounds_for(k, cfg)[1] is None or c <= _bounds_for(k, cfg)[1])
     }
-    print(f"[block]   {len(df_counts)} distinct keys seen, keeping {len(keep)} "
-          f"after df_min/df_max (dropped {len(df_counts) - len(keep)})")
+    n_other = sum(len(df) for df in dfs)
+    print(f"[block]   {len(df_counts)} distinct keys seen across {n_other} rows, "
+          f"keeping {len(keep)} after df_min/df_max (dropped {len(df_counts) - len(keep)})")
     del df_counts
 
     # --- Pass 2: build inverted index, but ONLY for keys that survived the cap. ---
-    # No list built here can ever exceed its configured df_max.
-    n_other = len(others)
     inv: dict[str, list[str]] = defaultdict(list)
     if n_jobs > 1 and n_other > chunk_size:
-        ranges = list(_chunks_idx(n_other, chunk_size))
-        with ctx.Pool(n_jobs, initializer=_pool_init_scan, initargs=(others, cfg, keep)) as pool:
+        ranges = _multi_ranges(dfs, chunk_size)
+        with ctx.Pool(n_jobs, initializer=_pool_init_scan, initargs=(dfs, cfg, keep)) as pool:
             for part in pool.imap_unordered(_scan_range, ranges):
                 for k, v in part.items():
                     inv[k].extend(v)
                 del part
     else:
-        for row in others.itertuples(index=False):
-            for k in _keys_row(row, cfg):
-                if k in keep:
-                    inv[k].append(row.entity_id)
+        for df in dfs:
+            for row in df.itertuples(index=False):
+                for k in _keys_row(row, cfg):
+                    if k in keep:
+                        inv[k].append(row.entity_id)
     del keep
 
     # --- Lookup: union candidates across every key the S1 row generates. ---
     n_s1 = len(s1n)
     out: dict[str, list[str]] = {}
     if n_jobs > 1 and n_s1 > chunk_size:
-        ranges = list(_chunks_idx(n_s1, chunk_size))
+        ranges = [(0, s, e) for s, e in _chunks_idx(n_s1, chunk_size)]
         with ctx.Pool(n_jobs, initializer=_pool_init_lookup, initargs=(inv, cfg, s1n)) as pool:
             for part in pool.imap_unordered(_lookup_range, ranges):
                 out.update(part)

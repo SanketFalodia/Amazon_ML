@@ -7,7 +7,7 @@ paths:
   output_dir: output
   cache_dir: cache
   model_path: cache/model.pkl
-  normalize_chunk_size: 100000   # NEW: rows/chunk during normalize -- bounds peak memory
+  normalize_chunk_size: 100000   # rows/chunk during normalize -- bounds peak memory
 
 # ---- blocking ----
 blocking:
@@ -17,8 +17,12 @@ blocking:
   minhash_threshold: 0.5        # LSH Jaccard threshold
   addr_token_df_max: 300
   use_lsh: true                 # set false if datasketch is unavailable
-  loc_token_df_max: 500         # NEW: caps cs:/nfirst:/nfirst2:/meta:/init: (previously uncapped)
-  n_jobs: 4                     # NEW: worker processes for blocking + pair-feature loops
+  loc_token_df_max: 500         # caps cs:/nfirst:/nfirst2:/meta:/init:
+  n_jobs: 2                     # CHANGED 4->2: extra safety margin now that the
+                                 # actual OOM cause (pd.concat in pipeline.py) is
+                                 # fixed. Try bumping back to 4 once a run at 2
+                                 # completes comfortably under the RAM ceiling.
+  chunk_size: 100000             # rows/chunk for the parallel scan/lookup passes
 
 # ---- model ----
 model:
@@ -29,17 +33,14 @@ model:
   subsample: 0.9
   colsample_bytree: 0.9
   reg_lambda: 1.0
-  n_folds: 3                  # GroupKFold by s1_id
+  n_folds: 3                    # GroupKFold by s1_id
   calibrate: true
-  max_train_pairs: 3000000      # NEW: hard cap on total (S1,candidate) training pairs.
+  max_train_pairs: 3000000      # hard cap on total (S1,candidate) training pairs.
                                  # All S1 entities with a true match are always kept in full;
                                  # the budget is filled out with a random sample of singleton
                                  # (no-match) entities. Bounds build_training_pairs() and the
                                  # tune_thresholds() grid search regardless of how many
                                  # candidates/entity blocking actually produces on your data.
-                                 # 3M pairs is generous for a 22-feature LightGBM model --
-                                 # raise it if you have RAM/time to spare, lower it (e.g. 1e6)
-                                 # if you want a faster/safer single run.
 
 # ---- F0.5 decision ----
 decision:

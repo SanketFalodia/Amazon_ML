@@ -74,26 +74,44 @@ def stage_prep(cfg):
     print("[prep] done")
 
 
-def _read_cached(cfg, name):
-    return pd.read_parquet(_cache(cfg, f"{name}.parquet"))
+def _read_cached(cfg, name, columns=None):
+    return pd.read_parquet(_cache(cfg, f"{name}.parquet"), columns=columns)
+
+
+# Reading only these columns (instead of all 21 normalized columns) roughly
+# halves the memory footprint of every post-prep stage, since parquet skips
+# deserializing columns you don't ask for entirely -- it's not just "loaded
+# then discarded", it's never read off disk into memory in the first place.
+# Verified against every file in src/ that business_name, business_address,
+# name_raw, name_full, addr_raw, addr_sorted are never touched after prep.
+_BLOCKING_COLS = ["entity_id", "name_no_legal", "name_sorted", "name_meta",
+                  "name_init", "pincode", "zip5", "city", "state",
+                  "addr_no_digits", "name_compact"]
+_FEATURE_COLS = ["entity_id", "name_no_legal", "addr_full", "addr_no_digits",
+                  "name_meta", "name_init", "pincode", "zip5", "house_no",
+                  "city", "state", "country", "is_landmark"]
+_TFIDF_COLS = ["entity_id", "name_no_legal", "addr_full"]
 
 
 def stage_block(cfg):
-    # Train and test are processed one at a time (load -> build_candidates -> free)
-    # instead of holding all four large frames (~21M+ rows combined) in memory at
-    # once. Same principle as stage_prep's sequential train/test handling.
-    s1n = _read_cached(cfg, "train_s1")
-    tr_others = pd.concat([_read_cached(cfg, "train_s2"), _read_cached(cfg, "train_s3")],
-                          ignore_index=True)
-    print(f"[block] building train candidates ({len(s1n)} x {len(tr_others)}) ...")
+    # S2+S3 are passed to build_candidates as a LIST, never concatenated --
+    # pd.concat() on two multi-million-row frames was the actual OOM trigger
+    # (it briefly holds both sources AND the combined result at once). Train
+    # and test are still processed one at a time (load -> use -> free).
+    s1n = _read_cached(cfg, "train_s1", columns=_BLOCKING_COLS)
+    tr_others = [_read_cached(cfg, "train_s2", columns=_BLOCKING_COLS),
+                 _read_cached(cfg, "train_s3", columns=_BLOCKING_COLS)]
+    print(f"[block] building train candidates ({len(s1n)} x "
+          f"{sum(len(d) for d in tr_others)}) ...")
     tr_cands = bl.build_candidates(s1n, tr_others, cfg["blocking"])
     json.dump(tr_cands, open(_cache(cfg, "train_cands.json"), "w"))
     del s1n, tr_others, tr_cands
 
-    te1 = _read_cached(cfg, "test_s1")
-    te_others = pd.concat([_read_cached(cfg, "test_s2"), _read_cached(cfg, "test_s3")],
-                          ignore_index=True)
-    print(f"[block] building test candidates ({len(te1)} x {len(te_others)}) ...")
+    te1 = _read_cached(cfg, "test_s1", columns=_BLOCKING_COLS)
+    te_others = [_read_cached(cfg, "test_s2", columns=_BLOCKING_COLS),
+                 _read_cached(cfg, "test_s3", columns=_BLOCKING_COLS)]
+    print(f"[block] building test candidates ({len(te1)} x "
+          f"{sum(len(d) for d in te_others)}) ...")
     te_cands = bl.build_candidates(te1, te_others, cfg["blocking"])
     json.dump(te_cands, open(_cache(cfg, "test_cands.json"), "w"))
     io.write_candidates(os.path.join(cfg["paths"]["output_dir"], "candidate_pairs.tsv"), te_cands)
@@ -103,10 +121,12 @@ def stage_block(cfg):
 
 
 def stage_featurize(cfg):
-    alln = pd.concat([_read_cached(cfg, n) for n in
-                      ("train_s1", "train_s2", "train_s3", "test_s1", "test_s2", "test_s3")],
-                     ignore_index=True)
-    name_mat, addr_mat, idx = ft.build_tfidf(alln)
+    # Passed as a LIST -- ft.build_tfidf extracts only the 3 needed columns
+    # per frame instead of pd.concat()-ing all 6 full (~21-column) frames.
+    names = ("train_s1", "train_s2", "train_s3", "test_s1", "test_s2", "test_s3")
+    dfs = [_read_cached(cfg, n, columns=_TFIDF_COLS) for n in names]
+    name_mat, addr_mat, idx = ft.build_tfidf(dfs)
+    del dfs
     import pickle
     with open(_cache(cfg, "vectors.pkl"), "wb") as f:
         pickle.dump((name_mat, addr_mat, idx), f)
@@ -160,9 +180,9 @@ def _sample_s1_by_pair_budget(s1n, cands, gt, budget, seed=42):
 
 def _train_pairs(cfg):
     import pickle
-    s1n = _read_cached(cfg, "train_s1")
-    s2n = _read_cached(cfg, "train_s2")
-    s3n = _read_cached(cfg, "train_s3")
+    s1n = _read_cached(cfg, "train_s1", columns=_FEATURE_COLS)
+    s2n = _read_cached(cfg, "train_s2", columns=_FEATURE_COLS)
+    s3n = _read_cached(cfg, "train_s3", columns=_FEATURE_COLS)
     cands = json.load(open(_cache(cfg, "train_cands.json")))
     gt = json.load(open(_cache(cfg, "ground_truth.json")))
     name_mat, addr_mat, idx = pickle.load(open(_cache(cfg, "vectors.pkl"), "rb"))
@@ -207,12 +227,12 @@ def stage_predict(cfg):
     import pickle
     clf = tm.load_model(cfg["paths"]["model_path"])
     thr = json.load(open(_cache(cfg, "thresholds.json")))
-    te1 = _read_cached(cfg, "test_s1")
-    by_id = pd.concat([_read_cached(cfg, "test_s2"), _read_cached(cfg, "test_s3")],
-                      ignore_index=True).set_index("entity_id", drop=False)
+    te1 = _read_cached(cfg, "test_s1", columns=_FEATURE_COLS)
+    te2 = _read_cached(cfg, "test_s2", columns=_FEATURE_COLS)
+    te3 = _read_cached(cfg, "test_s3", columns=_FEATURE_COLS)
     cands = json.load(open(_cache(cfg, "test_cands.json")))
     name_mat, addr_mat, idx = pickle.load(open(_cache(cfg, "vectors.pkl"), "rb"))
-    scored = pr.score_pairs(te1, by_id, cands, clf, name_mat, addr_mat, idx)
+    scored = pr.score_pairs(te1, te2, te3, cands, clf, name_mat, addr_mat, idx)
     mm = cfg["decision"].get("max_matches", 0)
     rows = {s1: pr.greedy_pick(sc, thr["t_open"], thr["t_add"], mm) for s1, sc in scored.items()}
     for s1 in te1["entity_id"]:

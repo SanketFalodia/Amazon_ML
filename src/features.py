@@ -3,12 +3,13 @@
 Changes vs original:
   - _v(row, key): generic field accessor so pair_features can take a namedtuple
     (from itertuples, used for the S1/"a" side) and a pandas Series (from .loc[],
-    used for the S2+S3/"b" side) interchangeably, without ever needing to convert
-    either side's full corpus into a Python dict/records list.
-  - build_tfidf(..., max_features=...): bounds the char n-gram vocabulary size.
-    Without this, fit_transform over 20M+ short strings has an unbounded
-    vocabulary as a function of your actual data -- the one remaining
-    memory operation in the pipeline that wasn't explicitly bounded.
+    used for the S2+S3/"b" side) interchangeably.
+  - build_tfidf(dfs, ...): accepts a LIST of dataframes (e.g. all 6 cached
+    parquet frames) and builds the name/addr/entity_id lists directly via
+    per-frame .tolist() + list.extend(), instead of pd.concat()-ing all of
+    them into one ~22M-row, 21-column frame first. Only 3 lists of plain
+    strings are ever held (not a full duplicated dataframe), and
+    max_features bounds the resulting vocabulary size.
 """
 from __future__ import annotations
 import numpy as np
@@ -29,15 +30,27 @@ def _v(row, key):
         return row[key]
 
 
-def build_tfidf(all_norm: pd.DataFrame, max_features: int = 100_000):
+def build_tfidf(dfs, max_features: int = 100_000):
+    """dfs: a DataFrame OR a list/tuple of DataFrames. Never concatenated --
+    only the three needed columns are extracted and extended into plain
+    lists, which is far cheaper than pd.concat() on the full ~21-column
+    frames at multi-million-row scale."""
+    frames = list(dfs) if isinstance(dfs, (list, tuple)) else [dfs]
+
+    name_texts: list[str] = []
+    addr_texts: list[str] = []
+    entity_ids: list[str] = []
+    for df in frames:
+        name_texts.extend(df["name_no_legal"].tolist())
+        addr_texts.extend(df["addr_full"].tolist())
+        entity_ids.extend(df["entity_id"].tolist())
+
     name_mat = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3),
-                                max_features=max_features).fit_transform(
-        all_norm["name_no_legal"])
+                                max_features=max_features).fit_transform(name_texts)
     addr_mat = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3),
-                                max_features=max_features).fit_transform(
-        all_norm["addr_full"])
-    ids = {e: i for i, e in enumerate(all_norm["entity_id"])}
-    return name_mat, addr_mat, ids
+                                max_features=max_features).fit_transform(addr_texts)
+    idx = {e: i for i, e in enumerate(entity_ids)}
+    return name_mat, addr_mat, idx
 
 
 def pair_features(a, b, name_mat, addr_mat, idx) -> dict:
