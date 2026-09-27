@@ -11,18 +11,31 @@ paths:
 
 # ---- blocking ----
 blocking:
-  rare_token_df_min: 2          # inverted index: only index tokens with df >= this
-  rare_token_df_max: 200        # ... and <= this (drop ultra-common tokens)
+  rare_token_df_min: 2       # inverted index: only index tokens with df >= this
+  rare_token_df_max: 200     # ... and <= this (drop ultra-common tokens)
   char_ngram_n: 3
-  minhash_threshold: 0.5        # LSH Jaccard threshold
+  minhash_threshold: 0.5     # LSH Jaccard threshold (currently unused by blocking.py)
   addr_token_df_max: 300
-  use_lsh: true                 # set false if datasketch is unavailable
-  loc_token_df_max: 500         # caps cs:/nfirst:/nfirst2:/meta:/init:
-  n_jobs: 2                     # CHANGED 4->2: extra safety margin now that the
-                                 # actual OOM cause (pd.concat in pipeline.py) is
-                                 # fixed. Try bumping back to 4 once a run at 2
-                                 # completes comfortably under the RAM ceiling.
-  chunk_size: 100000             # rows/chunk for the parallel scan/lookup passes
+  use_lsh: true               # currently unused by blocking.py -- no LSH code path there
+  loc_token_df_max: 500       # caps cs:/nfirst:/nfirst2:/meta:/init:
+  pin_token_df_max: 300       # NEW -- pin:/zip: were the ONE channel with no ceiling.
+                               # A postal code shared by thousands of entities was an
+                               # unbounded bucket -- every entity sharing it unioned the
+                               # whole bucket into its own candidate set. This is the
+                               # most likely actual cause of the RAM blowup. Same order
+                               # of magnitude as addr_token_df_max; tune down if the new
+                               # "largest surviving buckets" diagnostic line still shows
+                               # a huge one.
+  max_candidates_per_entity: 150   # NEW -- hard ceiling on any one S1 entity's final
+                               # candidate list, applied in the lookup phase. Backstop
+                               # against any other mega-bucket you haven't hit yet.
+                               # Unset (0/absent) = unbounded, old behavior.
+  n_jobs: 2                   # Left as-is. The pin_token_df_max + max_candidates_per_entity
+                               # caps above bound total memory to a computable ceiling on
+                               # their own; n_jobs is a secondary lever (fork can duplicate
+                               # the big S2/S3 string columns across workers) -- only drop
+                               # this to 1 if you still see OOM after the caps above.
+  chunk_size: 100000          # rows/chunk for the parallel scan/lookup passes
 
 # ---- model ----
 model:
@@ -33,20 +46,19 @@ model:
   subsample: 0.9
   colsample_bytree: 0.9
   reg_lambda: 1.0
-  n_folds: 3                    # GroupKFold by s1_id
+  n_folds: 3                  # GroupKFold by s1_id
   calibrate: true
-  max_train_pairs: 3000000      # hard cap on total (S1,candidate) training pairs.
-                                 # All S1 entities with a true match are always kept in full;
-                                 # the budget is filled out with a random sample of singleton
-                                 # (no-match) entities. Bounds build_training_pairs() and the
-                                 # tune_thresholds() grid search regardless of how many
-                                 # candidates/entity blocking actually produces on your data.
+  max_train_pairs: 3000000    # hard cap on total (S1,candidate) training pairs.
+                               # All S1 entities with a true match are always kept in full;
+                               # the budget is filled out with a random sample of singleton
+                               # (no-match) entities. Bounds build_training_pairs() and the
+                               # tune_thresholds() grid search regardless of how many
+                               # candidates/entity blocking actually produces on your data.
 
 # ---- F0.5 decision ----
 decision:
   t_open_grid: [0.30, 0.94, 0.02]   # start, stop (incl), step
-  t_add_grid:  [0.20, 0.94, 0.02]
+  t_add_grid: [0.20, 0.94, 0.02]
   greedy_per_entity: true
-  max_matches: 0                    # 0 = unlimited; set 1..3 if EDA says many-to-one
-
+  max_matches: 0               # 0 = unlimited; set 1..3 if EDA says many-to-one
 team_name: myteam

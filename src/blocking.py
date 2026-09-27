@@ -11,22 +11,46 @@ candidates (2206821 x 10320219)"):
   under a key if that key's global df is within [df_min, df_max] for its
   type. Keys that are too rare or too common are never turned into an id list.
 
-NEW in this version: `others` is accepted as a DataFrame OR a list/tuple of
-DataFrames (e.g. [s2n, s3n]) and is NEVER internally concatenated. The actual
-remaining OOM trigger was not inside this module -- it was pd.concat([s2n, s3n])
-being called in pipeline.py *before* build_candidates() was even invoked.
-pd.concat() on two multi-million-row frames briefly holds both source frames
-AND the new combined result simultaneously (until the sources are garbage
-collected), which is enough on its own to exhaust 30GB at this scale. Accepting
-a list and iterating each frame's own chunks sidesteps that spike entirely.
+`others` is accepted as a DataFrame OR a list/tuple of DataFrames (e.g.
+[s2n, s3n]) and is NEVER internally concatenated -- pd.concat() on two
+multi-million-row frames briefly holds both source frames AND the combined
+result simultaneously, which is enough on its own to exhaust RAM at this
+scale. Accepting a list and iterating each frame's own chunks sidesteps
+that spike entirely.
 
-Everything else (chunked itertuples() streaming, fork-based Pool sharing each
-source DataFrame via copy-on-write, per-key-type caps, the two-pass count/cap
-logic) is unchanged.
+THIRD FIX (this version): pin:/zip: keys were the one channel with NO
+df_max, on the theory that a postal code is "rarely a mega-block". At
+11M+ records that assumption breaks -- a single PIN/ZIP shared by a dense
+area (very common in India, where a 6-digit PIN can cover a whole
+district) becomes an unbounded bucket. In the lookup phase, EVERY S1
+entity sharing that key unions the whole bucket into its own candidate
+set, so a 300k-id bucket shared by 100k entities alone produces ~3*10^10
+pointer-slots -- this is almost certainly what actually exhausted RAM
+right after the "distinct keys ... keeping ..." checkpoint, since that
+checkpoint prints fine and the crash happens silently afterward, in the
+lookup phase, with no further output.
+
+Two changes fix this:
+  1. `_bounds_for` now caps pin:/zip: the same way every other channel is
+     capped (new `pin_token_df_max` config key, defaults to 300).
+  2. A hard `max_candidates_per_entity` ceiling is applied in the lookup
+     phase, as a backstop against ANY future mega-bucket, known or not --
+     it truncates (not silently grows) any one entity's final candidate
+     list. Off by default (unset in config = unbounded, unchanged
+     behavior) so this is safe to drop in even before you've set it.
+
+A diagnostic line was also added after Pass 1: it prints the 5 largest
+surviving buckets by count, so you can directly confirm on your own data
+whether a pin:/zip: (or any other) key was in fact the mega-bucket.
+
+Everything else (chunked itertuples() streaming, fork-based Pool sharing
+each source DataFrame via copy-on-write, the two-pass count/cap logic) is
+unchanged.
 """
 from __future__ import annotations
 from collections import defaultdict, Counter
 from multiprocessing import get_context
+import heapq
 import os
 import pandas as pd
 
@@ -92,7 +116,12 @@ def _bounds_for(k: str, cfg: dict) -> tuple[int, int | None]:
         return 0, cfg["addr_token_df_max"]
     if k.startswith(("cs:", "nfirst:", "nfirst2:", "meta:", "init:")):
         return 0, cfg.get("loc_token_df_max", cfg["rare_token_df_max"])
-    return 0, None  # pin:/zip: stay uncapped -- exact numeric match, rarely a mega-block
+    if k.startswith(("pin:", "zip:")):
+        # FIX: was `return 0, None` (uncapped). See module docstring -- a
+        # PIN/ZIP shared by thousands of entities was an unbounded mega-
+        # bucket and is the most likely actual cause of the RAM blowup.
+        return 0, cfg.get("pin_token_df_max", 300)
+    return 0, None
 
 
 _G_DFS = None   # list/tuple of DataFrames, indexed by df_idx -- never concatenated
@@ -139,6 +168,7 @@ def _pool_init_lookup(inv, cfg, df):
 def _lookup_range(rng: tuple[int, int, int]) -> dict[str, list[str]]:
     _, start, end = rng
     inv, cfg, df = _G_INV, _G_CFG, _G_DFS[0]
+    cap = cfg.get("max_candidates_per_entity")  # NEW -- None/0 = unbounded (old behavior)
     out: dict[str, list[str]] = {}
     for row in df.iloc[start:end].itertuples(index=False):
         see: set[str] = set()
@@ -146,7 +176,10 @@ def _lookup_range(rng: tuple[int, int, int]) -> dict[str, list[str]]:
             ids = inv.get(k)
             if ids:
                 see.update(ids)
-        out[row.entity_id] = sorted(see)
+        result = sorted(see)
+        if cap:
+            result = result[:cap]           # NEW -- hard per-entity ceiling
+        out[row.entity_id] = result
     return out
 
 
@@ -186,6 +219,13 @@ def build_candidates(s1n: pd.DataFrame, others, cfg: dict) -> dict[str, list[str
     n_other = sum(len(df) for df in dfs)
     print(f"[block]   {len(df_counts)} distinct keys seen across {n_other} rows, "
           f"keeping {len(keep)} after df_min/df_max (dropped {len(df_counts) - len(keep)})")
+
+    # NEW -- diagnostic: shows you directly whether a pin:/zip: (or any other)
+    # key was the mega-bucket. Cheap: a single pass with a size-5 heap.
+    top = heapq.nlargest(5, ((c, k) for k, c in df_counts.items() if k in keep))
+    print("[block]   largest surviving buckets: " +
+          ", ".join(f"{k}={c}" for c, k in top))
+
     del df_counts
 
     # --- Pass 2: build inverted index, but ONLY for keys that survived the cap. ---
@@ -207,6 +247,7 @@ def build_candidates(s1n: pd.DataFrame, others, cfg: dict) -> dict[str, list[str
 
     # --- Lookup: union candidates across every key the S1 row generates. ---
     n_s1 = len(s1n)
+    cap = cfg.get("max_candidates_per_entity")  # NEW
     out: dict[str, list[str]] = {}
     if n_jobs > 1 and n_s1 > chunk_size:
         ranges = [(0, s, e) for s, e in _chunks_idx(n_s1, chunk_size)]
@@ -221,6 +262,9 @@ def build_candidates(s1n: pd.DataFrame, others, cfg: dict) -> dict[str, list[str
                 ids = inv.get(k)
                 if ids:
                     see.update(ids)
-            out[row.entity_id] = sorted(see)
+            result = sorted(see)
+            if cap:
+                result = result[:cap]        # NEW
+            out[row.entity_id] = result
 
     return out
