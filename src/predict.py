@@ -1,8 +1,9 @@
 """F0.5-optimal decision: two-threshold search + per-entity greedy Fhat_0.5.
 
-Optimized vs original: score_pairs() gets the same dict-record + multiprocessing
-treatment as train_model.build_training_pairs (see that file for why). Everything
-below score_pairs (greedy_pick, tune_thresholds, _fhat) is unchanged.
+score_pairs() gets the same memory-bounded treatment as train_model.build_training_pairs
+(see that file for the reasoning): the "b" side stays a DataFrame with .loc[] access,
+the "a" side streams via itertuples() in bounded chunks distributed across processes.
+Everything below score_pairs (greedy_pick, tune_thresholds, _fhat) is unchanged.
 """
 from __future__ import annotations
 import os
@@ -21,24 +22,30 @@ def _ctx():
         return get_context()
 
 
+def _chunks_idx(n: int, size: int):
+    for i in range(0, n, size):
+        yield (i, min(i + size, n))
+
+
 _G: dict = {}
 
 
-def _pool_init(by_id, cands, clf, name_mat, addr_mat, idx):
-    _G["by_id"], _G["cands"], _G["clf"] = by_id, cands, clf
+def _pool_init(s1n, by_id, cands, clf, name_mat, addr_mat, idx):
+    _G["s1n"], _G["by_id"], _G["cands"], _G["clf"] = s1n, by_id, cands, clf
     _G["name_mat"], _G["addr_mat"], _G["idx"] = name_mat, addr_mat, idx
 
 
-def _score_chunk(s1_records: list[dict]):
-    by_id, cands, clf = _G["by_id"], _G["cands"], _G["clf"]
+def _score_range(rng: tuple[int, int]):
+    start, end = rng
+    s1n, by_id, cands, clf = _G["s1n"], _G["by_id"], _G["cands"], _G["clf"]
     name_mat, addr_mat, idx = _G["name_mat"], _G["addr_mat"], _G["idx"]
     out = {}
-    for a in s1_records:
-        s1 = a["entity_id"]
-        ids = [c for c in cands.get(s1, []) if c in by_id]
+    for a in s1n.iloc[start:end].itertuples(index=False):
+        s1 = a.entity_id
+        ids = [c for c in cands.get(s1, []) if c in by_id.index]
         scored = []
         if ids:
-            X = pd.DataFrame([pair_features(a, by_id[c], name_mat, addr_mat, idx)
+            X = pd.DataFrame([pair_features(a, by_id.loc[c], name_mat, addr_mat, idx)
                               for c in ids])[feature_columns()]
             p = clf.predict_proba(X)[:, 1]
             scored = sorted(zip(p.tolist(), ids), reverse=True)
@@ -46,35 +53,27 @@ def _score_chunk(s1_records: list[dict]):
     return out
 
 
-def _chunks(lst: list, n: int):
-    size = max(1, -(-len(lst) // n))
-    for i in range(0, len(lst), size):
-        yield lst[i:i + size]
-
-
 def score_pairs(s1n, by_id_df, cands, clf, name_mat, addr_mat, idx,
-                n_jobs=None) -> dict[str, list[tuple[float, str]]]:
-    by_id = {r["entity_id"]: r for r in by_id_df.to_dict("records")}
-    s1_records = s1n.to_dict("records")
+                n_jobs=None, chunk_size=200_000) -> dict[str, list[tuple[float, str]]]:
     n_jobs = n_jobs or os.cpu_count() or 1
     ctx = _ctx()
+    n = len(s1n)
 
-    if n_jobs > 1 and len(s1_records) > 2000:
-        chunks = list(_chunks(s1_records, n_jobs))
-        with ctx.Pool(n_jobs, initializer=_pool_init,
-                       initargs=(by_id, cands, clf, name_mat, addr_mat, idx)) as pool:
-            parts = pool.map(_score_chunk, chunks)
+    if n_jobs > 1 and n > chunk_size:
+        ranges = list(_chunks_idx(n, chunk_size))
         out: dict[str, list[tuple[float, str]]] = {}
-        for p in parts:
-            out.update(p)
+        with ctx.Pool(n_jobs, initializer=_pool_init,
+                       initargs=(s1n, by_id_df, cands, clf, name_mat, addr_mat, idx)) as pool:
+            for part in pool.imap_unordered(_score_range, ranges):
+                out.update(part)
+                del part
         return out
 
-    _pool_init(by_id, cands, clf, name_mat, addr_mat, idx)
-    return _score_chunk(s1_records)
+    _pool_init(s1n, by_id_df, cands, clf, name_mat, addr_mat, idx)
+    return _score_range((0, n))
 
 
 def _fhat(probs: list[float]) -> float:
-    """Estimated F0.5 of choosing this set given calibrated prob list."""
     if not probs:
         return 0.0
     k = len(probs)

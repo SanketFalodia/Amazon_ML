@@ -1,11 +1,18 @@
 """Train + calibrate LightGBM on blocking candidates labelled by ground truth.
 
-Optimized vs original:
-  1. iterrows()/.loc[] -> plain dicts. Series-level indexing (by_id.loc[cid]) is
-     slow one-row-at-a-time; a dict keyed by entity_id is O(1) attribute-style access.
-  2. The per-S1-row loop (which drives every pair_features() call -- your actual
-     hot path, since it runs ~9 rapidfuzz comparisons + 2 sparse dot products per
-     candidate) is split across cfg["n_jobs"] processes via fork, so all cores get used.
+Optimized vs original, in order of impact:
+  1. The "b" side (S2+S3 combined, potentially 10M+ rows) is NEVER converted to a
+     Python dict/list of records -- it stays a DataFrame indexed by entity_id, and
+     individual candidate rows are fetched via .loc[cid] (the same technique the
+     ORIGINAL code used, because it's memory-safe: a records-list of this side
+     would hold ~10M standalone dict objects simultaneously, often exceeding the
+     memory the source parquet files themselves take).
+  2. The "a" side (S1 rows, the loop driver) is streamed via itertuples() in
+     bounded chunks (default 200k rows) rather than materialized all at once.
+  3. Chunks are distributed across cfg-configured worker processes via fork +
+     Pool.imap_unordered, so only n_jobs chunks are ever in flight, and the
+     shared by_id DataFrame is inherited via copy-on-write, not re-pickled
+     per task.
 """
 from __future__ import annotations
 import os
@@ -26,25 +33,31 @@ def _ctx():
         return get_context()
 
 
+def _chunks_idx(n: int, size: int):
+    for i in range(0, n, size):
+        yield (i, min(i + size, n))
+
+
 _G: dict = {}
 
 
-def _pool_init(by_id, cands, truth, name_mat, addr_mat, idx):
-    _G["by_id"], _G["cands"], _G["truth"] = by_id, cands, truth
+def _pool_init(s1n, by_id, cands, truth, name_mat, addr_mat, idx):
+    _G["s1n"], _G["by_id"], _G["cands"], _G["truth"] = s1n, by_id, cands, truth
     _G["name_mat"], _G["addr_mat"], _G["idx"] = name_mat, addr_mat, idx
 
 
-def _pairs_for_chunk(s1_records: list[dict]):
-    by_id, cands, truth = _G["by_id"], _G["cands"], _G["truth"]
+def _pairs_range(rng: tuple[int, int]):
+    start, end = rng
+    s1n, by_id, cands, truth = _G["s1n"], _G["by_id"], _G["cands"], _G["truth"]
     name_mat, addr_mat, idx = _G["name_mat"], _G["addr_mat"], _G["idx"]
     X, y, groups, meta = [], [], [], []
-    for a in s1_records:
-        s1 = a["entity_id"]
+    for a in s1n.iloc[start:end].itertuples(index=False):
+        s1 = a.entity_id
         tset = set(truth.get(s1, []))
         for cid in cands.get(s1, []):
-            b = by_id.get(cid)
-            if b is None:
+            if cid not in by_id.index:
                 continue
+            b = by_id.loc[cid]
             X.append(pair_features(a, b, name_mat, addr_mat, idx))
             y.append(1 if cid in tset else 0)
             groups.append(s1)
@@ -52,31 +65,27 @@ def _pairs_for_chunk(s1_records: list[dict]):
     return X, y, groups, meta
 
 
-def _chunks(lst: list, n: int):
-    size = max(1, -(-len(lst) // n))
-    for i in range(0, len(lst), size):
-        yield lst[i:i + size]
-
-
-def build_training_pairs(s1n, s2n, s3n, cands, truth, name_mat, addr_mat, idx, n_jobs=None):
-    by_id_df = pd.concat([s2n, s3n], ignore_index=True)
-    by_id = {r["entity_id"]: r for r in by_id_df.to_dict("records")}
-    s1_records = s1n.to_dict("records")
-
+def build_training_pairs(s1n, s2n, s3n, cands, truth, name_mat, addr_mat, idx,
+                          n_jobs=None, chunk_size=200_000):
+    by_id_df = pd.concat([s2n, s3n], ignore_index=True).set_index("entity_id", drop=False)
     n_jobs = n_jobs or os.cpu_count() or 1
     ctx = _ctx()
-
-    if n_jobs > 1 and len(s1_records) > 2000:
-        chunks = list(_chunks(s1_records, n_jobs))
-        with ctx.Pool(n_jobs, initializer=_pool_init,
-                       initargs=(by_id, cands, truth, name_mat, addr_mat, idx)) as pool:
-            parts = pool.map(_pairs_for_chunk, chunks)
-    else:
-        _pool_init(by_id, cands, truth, name_mat, addr_mat, idx)
-        parts = [_pairs_for_chunk(s1_records)]
+    n = len(s1n)
 
     X, y, groups, meta = [], [], [], []
-    for px, py, pg, pm in parts:
+    if n_jobs > 1 and n > chunk_size:
+        ranges = list(_chunks_idx(n, chunk_size))
+        with ctx.Pool(n_jobs, initializer=_pool_init,
+                       initargs=(s1n, by_id_df, cands, truth, name_mat, addr_mat, idx)) as pool:
+            for px, py, pg, pm in pool.imap_unordered(_pairs_range, ranges):
+                X.extend(px)
+                y.extend(py)
+                groups.extend(pg)
+                meta.extend(pm)
+                del px, py, pg, pm
+    else:
+        _pool_init(s1n, by_id_df, cands, truth, name_mat, addr_mat, idx)
+        px, py, pg, pm = _pairs_range((0, n))
         X.extend(px)
         y.extend(py)
         groups.extend(pg)
