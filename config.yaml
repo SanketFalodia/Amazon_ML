@@ -22,14 +22,14 @@ blocking:
 
 # ---- model ----
 model:
-  n_estimators: 3000
+  n_estimators: 900
   learning_rate: 0.03
   num_leaves: 63
   min_child_samples: 40
   subsample: 0.9
   colsample_bytree: 0.9
   reg_lambda: 1.0
-  n_folds: 5                    # GroupKFold by s1_id
+  n_folds: 3                  # GroupKFold by s1_id
   calibrate: true
   max_train_pairs: 3000000      # NEW: hard cap on total (S1,candidate) training pairs.
                                  # All S1 entities with a true match are always kept in full;
