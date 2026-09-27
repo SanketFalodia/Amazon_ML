@@ -1,4 +1,3 @@
-%%writefile src/pipeline.py
 """Orchestrator: prep -> block -> featurize -> train -> predict -> validate -> package."""
 from __future__ import annotations
 import os
