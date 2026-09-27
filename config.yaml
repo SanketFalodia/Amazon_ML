@@ -31,6 +31,15 @@ model:
   reg_lambda: 1.0
   n_folds: 5                    # GroupKFold by s1_id
   calibrate: true
+  max_train_pairs: 3000000      # NEW: hard cap on total (S1,candidate) training pairs.
+                                 # All S1 entities with a true match are always kept in full;
+                                 # the budget is filled out with a random sample of singleton
+                                 # (no-match) entities. Bounds build_training_pairs() and the
+                                 # tune_thresholds() grid search regardless of how many
+                                 # candidates/entity blocking actually produces on your data.
+                                 # 3M pairs is generous for a 22-feature LightGBM model --
+                                 # raise it if you have RAM/time to spare, lower it (e.g. 1e6)
+                                 # if you want a faster/safer single run.
 
 # ---- F0.5 decision ----
 decision:

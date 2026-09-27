@@ -113,6 +113,51 @@ def stage_featurize(cfg):
     print(f"[feat] tfidf matrices built: name{name_mat.shape} addr{addr_mat.shape}")
 
 
+def _sample_s1_by_pair_budget(s1n, cands, gt, budget, seed=42):
+    """Cap TOTAL training pairs (not just S1 entity count) at `budget`, so runtime
+    and memory in build_training_pairs()/tune_thresholds() stay bounded regardless
+    of how dense the actual blocking candidates turn out to be.
+
+    Every S1 entity with a true match is kept -- positives are the scarce, essential
+    training signal and are never dropped. The remaining budget is filled with a
+    random sample of match-free (singleton) entities, whose candidates are pure
+    hard-negative signal. Order of `s1n` is preserved among kept rows.
+    """
+    import numpy as np
+    ids = s1n["entity_id"].tolist()
+    n_cands = np.array([len(cands.get(i, [])) for i in ids])
+    has_match = np.array([bool(gt.get(i)) for i in ids])
+
+    pos_idx = np.where(has_match)[0]
+    neg_idx = np.where(~has_match)[0]
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(neg_idx)
+
+    keep = set(pos_idx.tolist())
+    running = int(n_cands[pos_idx].sum())
+    if running >= budget:
+        print(f"[train] positives alone already use {running:,} pairs (budget "
+              f"{budget:,}) -- keeping all positives, adding no extra negatives")
+    else:
+        for i in neg_idx:
+            c = int(n_cands[i])
+            if running + c > budget:
+                continue  # skip this one, a smaller later entity might still fit
+            keep.add(int(i))
+            running += c
+            if running >= budget:
+                break
+
+    kept_idx = sorted(keep)
+    kept = s1n.iloc[kept_idx].reset_index(drop=True)
+    n_neg_kept = len(kept_idx) - len(pos_idx)
+    print(f"[train] pair-budget sample: kept {len(kept_idx):,}/{len(s1n):,} S1 entities "
+          f"({len(pos_idx):,} positives + {n_neg_kept:,} singleton negatives) "
+          f"-> ~{running:,} training pairs (budget {budget:,})")
+    return kept
+
+
 def _train_pairs(cfg):
     import pickle
     s1n = _read_cached(cfg, "train_s1")
@@ -121,6 +166,11 @@ def _train_pairs(cfg):
     cands = json.load(open(_cache(cfg, "train_cands.json")))
     gt = json.load(open(_cache(cfg, "ground_truth.json")))
     name_mat, addr_mat, idx = pickle.load(open(_cache(cfg, "vectors.pkl"), "rb"))
+
+    budget = cfg["model"].get("max_train_pairs")
+    if budget:
+        s1n = _sample_s1_by_pair_budget(s1n, cands, gt, budget)
+
     return tm.build_training_pairs(s1n, s2n, s3n, cands, gt, name_mat, addr_mat, idx), (name_mat, addr_mat, idx)
 
 
