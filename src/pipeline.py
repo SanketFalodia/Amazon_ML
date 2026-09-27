@@ -1,3 +1,4 @@
+%%writefile src/pipeline.py
 """Orchestrator: prep -> block -> featurize -> train -> predict -> validate -> package."""
 from __future__ import annotations
 import os
@@ -98,13 +99,18 @@ def stage_block(cfg):
     # pd.concat() on two multi-million-row frames was the actual OOM trigger
     # (it briefly holds both sources AND the combined result at once). Train
     # and test are still processed one at a time (load -> use -> free).
+    import gzip
     s1n = _read_cached(cfg, "train_s1", columns=_BLOCKING_COLS)
     tr_others = [_read_cached(cfg, "train_s2", columns=_BLOCKING_COLS),
                  _read_cached(cfg, "train_s3", columns=_BLOCKING_COLS)]
     print(f"[block] building train candidates ({len(s1n)} x "
           f"{sum(len(d) for d in tr_others)}) ...")
     tr_cands = bl.build_candidates(s1n, tr_others, cfg["blocking"])
-    json.dump(tr_cands, open(_cache(cfg, "train_cands.json"), "w"))
+    # gzip: this file has millions of repeated "S2-"/"S3-" id fragments and
+    # compresses very well (typically 70-85%) -- meaningful disk relief at
+    # this row count, and _train_pairs() reads it back transparently.
+    with gzip.open(_cache(cfg, "train_cands.json.gz"), "wt", encoding="utf-8") as f:
+        json.dump(tr_cands, f)
     del s1n, tr_others, tr_cands
 
     te1 = _read_cached(cfg, "test_s1", columns=_BLOCKING_COLS)
@@ -113,24 +119,38 @@ def stage_block(cfg):
     print(f"[block] building test candidates ({len(te1)} x "
           f"{sum(len(d) for d in te_others)}) ...")
     te_cands = bl.build_candidates(te1, te_others, cfg["blocking"])
-    json.dump(te_cands, open(_cache(cfg, "test_cands.json"), "w"))
     io.write_candidates(os.path.join(cfg["paths"]["output_dir"], "candidate_pairs.tsv"), te_cands)
     avg = np.mean([len(v) for v in te_cands.values()])
     print(f"[block] test candidates/entity avg={avg:.1f}  wrote candidate_pairs.tsv")
+    # NOTE: no separate test_cands.json is written -- candidate_pairs.tsv
+    # above holds the exact same data and is what stage_predict reads back.
+    # Writing it twice (once as JSON cache, once as the required TSV output)
+    # was pure duplication and, at ~119 candidates/entity across 1.7M+
+    # entities, was eating multiple GB of disk for no benefit.
     del te1, te_others, te_cands
 
 
 def stage_featurize(cfg):
-    # Passed as a LIST -- ft.build_tfidf extracts only the 3 needed columns
-    # per frame instead of pd.concat()-ing all 6 full (~21-column) frames.
+    # Loaders (not pre-loaded frames): build_tfidf calls each loader twice
+    # (sample pass, transform pass) and only ever holds ONE frame in memory
+    # at a time -- the previous version loaded all 6 frames AND built a
+    # merged ~24M-row text list AND held both output matrices simultaneously,
+    # which is what exhausted RAM here. See features.build_tfidf's docstring
+    # for why the bounded-sample fit + min_df=2 + float32 are safe, not a
+    # quality tradeoff.
     names = ("train_s1", "train_s2", "train_s3", "test_s1", "test_s2", "test_s3")
-    dfs = [_read_cached(cfg, n, columns=_TFIDF_COLS) for n in names]
-    name_mat, addr_mat, idx = ft.build_tfidf(dfs)
-    del dfs
+    loaders = [(lambda n=n: _read_cached(cfg, n, columns=_TFIDF_COLS)) for n in names]
+    name_mat, addr_mat, idx = ft.build_tfidf(
+        loaders,
+        max_features=cfg["model"].get("tfidf_max_features", 100_000),
+        min_df=cfg["model"].get("tfidf_min_df", 2),
+        fit_sample_per_frame=cfg["model"].get("tfidf_fit_sample_per_frame", 500_000),
+    )
     import pickle
     with open(_cache(cfg, "vectors.pkl"), "wb") as f:
-        pickle.dump((name_mat, addr_mat, idx), f)
-    print(f"[feat] tfidf matrices built: name{name_mat.shape} addr{addr_mat.shape}")
+        pickle.dump((name_mat, addr_mat, idx), f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[feat] tfidf matrices built: name{name_mat.shape} (nnz={name_mat.nnz:,}) "
+          f"addr{addr_mat.shape} (nnz={addr_mat.nnz:,})")
 
 
 def _sample_s1_by_pair_budget(s1n, cands, gt, budget, seed=42):
@@ -180,10 +200,12 @@ def _sample_s1_by_pair_budget(s1n, cands, gt, budget, seed=42):
 
 def _train_pairs(cfg):
     import pickle
+    import gzip
     s1n = _read_cached(cfg, "train_s1", columns=_FEATURE_COLS)
     s2n = _read_cached(cfg, "train_s2", columns=_FEATURE_COLS)
     s3n = _read_cached(cfg, "train_s3", columns=_FEATURE_COLS)
-    cands = json.load(open(_cache(cfg, "train_cands.json")))
+    with gzip.open(_cache(cfg, "train_cands.json.gz"), "rt", encoding="utf-8") as f:
+        cands = json.load(f)
     gt = json.load(open(_cache(cfg, "ground_truth.json")))
     name_mat, addr_mat, idx = pickle.load(open(_cache(cfg, "vectors.pkl"), "rb"))
 
@@ -230,7 +252,10 @@ def stage_predict(cfg):
     te1 = _read_cached(cfg, "test_s1", columns=_FEATURE_COLS)
     te2 = _read_cached(cfg, "test_s2", columns=_FEATURE_COLS)
     te3 = _read_cached(cfg, "test_s3", columns=_FEATURE_COLS)
-    cands = json.load(open(_cache(cfg, "test_cands.json")))
+    # test_cands.json is no longer written by stage_block (see its comment) --
+    # candidate_pairs.tsv is the same data and is what actually gets scored.
+    cands = _read_out(os.path.join(cfg["paths"]["output_dir"], "candidate_pairs.tsv"),
+                       "candidate_entity_ids")
     name_mat, addr_mat, idx = pickle.load(open(_cache(cfg, "vectors.pkl"), "rb"))
     scored = pr.score_pairs(te1, te2, te3, cands, clf, name_mat, addr_mat, idx)
     mm = cfg["decision"].get("max_matches", 0)

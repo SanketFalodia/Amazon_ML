@@ -30,25 +30,74 @@ def _v(row, key):
         return row[key]
 
 
-def build_tfidf(dfs, max_features: int = 100_000):
-    """dfs: a DataFrame OR a list/tuple of DataFrames. Never concatenated --
-    only the three needed columns are extracted and extended into plain
-    lists, which is far cheaper than pd.concat() on the full ~21-column
-    frames at multi-million-row scale."""
-    frames = list(dfs) if isinstance(dfs, (list, tuple)) else [dfs]
+def build_tfidf(loaders, max_features: int = 100_000, min_df: int = 2,
+                 fit_sample_per_frame: int = 500_000, seed: int = 42):
+    """loaders: a list of zero-arg callables, each returning ONE freshly-loaded
+    frame with [entity_id, name_no_legal, addr_full] (e.g. one per cached
+    parquet file). Called TWICE (sample pass, transform pass) so at most one
+    frame is ever held in memory -- the previous version held all 6 loaded
+    frames PLUS a merged ~24M-row text list PLUS the two output matrices
+    simultaneously, which is what actually exhausted RAM.
 
-    name_texts: list[str] = []
-    addr_texts: list[str] = []
-    entity_ids: list[str] = []
-    for df in frames:
-        name_texts.extend(df["name_no_legal"].tolist())
-        addr_texts.extend(df["addr_full"].tolist())
+    Pass 1 (fit): draws up to `fit_sample_per_frame` random rows from each
+    frame and fits the vocabulary on that bounded sample instead of all 24M+
+    rows. max_features already caps the target vocabulary size, so a several-
+    million-row sample converges to essentially the same vocabulary as a
+    full-corpus fit, at a fraction of the time/memory.
+
+    Pass 2 (transform): transforms each frame separately with the now-fitted
+    vectorizer and vstacks the per-frame blocks -- a merged text list the
+    size of the whole corpus is never built.
+
+    min_df=2 is free, not a tradeoff: a term with GLOBAL document frequency 1
+    appears in exactly one entity in the whole corpus, so it can never be
+    shared between the two DIFFERENT entities in any pair -- it can never
+    make a nonzero contribution to that pair's name_tfidf/addr_tfidf dot
+    product either way. Dropping it changes no pair's feature value, only
+    removes dead weight from the matrix (and it doesn't change surviving
+    terms' IDF values, since sklearn computes those from the kept vocabulary
+    and the same fixed document count).
+
+    dtype=float32 (vs sklearn's float64 default) halves the sparse matrix's
+    per-nonzero byte cost, with no meaningful precision loss for a 0..1
+    similarity feature.
+    """
+    rng = np.random.default_rng(seed)
+
+    def _sampled_col(df, col):
+        n = len(df)
+        if n <= fit_sample_per_frame:
+            return df[col].tolist()
+        take = rng.choice(n, size=fit_sample_per_frame, replace=False)
+        return df[col].iloc[take].tolist()
+
+    name_sample: list[str] = []
+    addr_sample: list[str] = []
+    for load in loaders:
+        df = load()
+        name_sample.extend(_sampled_col(df, "name_no_legal"))
+        addr_sample.extend(_sampled_col(df, "addr_full"))
+        del df
+
+    name_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3),
+                                max_features=max_features, min_df=min_df, dtype=np.float32)
+    addr_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3),
+                                max_features=max_features, min_df=min_df, dtype=np.float32)
+    name_vec.fit(name_sample)
+    addr_vec.fit(addr_sample)
+    del name_sample, addr_sample
+
+    import scipy.sparse as sp
+    name_parts, addr_parts, entity_ids = [], [], []
+    for load in loaders:
+        df = load()
+        name_parts.append(name_vec.transform(df["name_no_legal"]))
+        addr_parts.append(addr_vec.transform(df["addr_full"]))
         entity_ids.extend(df["entity_id"].tolist())
+        del df
 
-    name_mat = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3),
-                                max_features=max_features).fit_transform(name_texts)
-    addr_mat = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3),
-                                max_features=max_features).fit_transform(addr_texts)
+    name_mat = sp.vstack(name_parts, format="csr")
+    addr_mat = sp.vstack(addr_parts, format="csr")
     idx = {e: i for i, e in enumerate(entity_ids)}
     return name_mat, addr_mat, idx
 

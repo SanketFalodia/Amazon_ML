@@ -1,9 +1,9 @@
 """F0.5-optimal decision: two-threshold search + per-entity greedy Fhat_0.5.
 
-score_pairs() gets the same memory-bounded treatment as train_model.build_training_pairs
-(see that file for the reasoning): the "b" side stays a DataFrame with .loc[] access,
-the "a" side streams via itertuples() in bounded chunks distributed across processes.
-Everything below score_pairs (greedy_pick, tune_thresholds, _fhat) is unchanged.
+score_pairs() takes s2n/s3n SEPARATELY and dispatches by entity_id prefix
+(S2- / S3-), same reasoning as train_model.build_training_pairs: avoids the
+pd.concat() memory spike on multi-million-row frames. Everything below
+score_pairs (greedy_pick, tune_thresholds, _fhat) is unchanged.
 """
 from __future__ import annotations
 import os
@@ -27,34 +27,51 @@ def _chunks_idx(n: int, size: int):
         yield (i, min(i + size, n))
 
 
+def _lookup_b(cid: str, s2_idx: pd.DataFrame, s3_idx: pd.DataFrame):
+    if cid.startswith("S2-"):
+        return s2_idx.loc[cid] if cid in s2_idx.index else None
+    if cid.startswith("S3-"):
+        return s3_idx.loc[cid] if cid in s3_idx.index else None
+    return None
+
+
 _G: dict = {}
 
 
-def _pool_init(s1n, by_id, cands, clf, name_mat, addr_mat, idx):
-    _G["s1n"], _G["by_id"], _G["cands"], _G["clf"] = s1n, by_id, cands, clf
+def _pool_init(s1n, s2_idx, s3_idx, cands, clf, name_mat, addr_mat, idx):
+    _G["s1n"], _G["s2_idx"], _G["s3_idx"] = s1n, s2_idx, s3_idx
+    _G["cands"], _G["clf"] = cands, clf
     _G["name_mat"], _G["addr_mat"], _G["idx"] = name_mat, addr_mat, idx
 
 
 def _score_range(rng: tuple[int, int]):
     start, end = rng
-    s1n, by_id, cands, clf = _G["s1n"], _G["by_id"], _G["cands"], _G["clf"]
+    s1n, s2_idx, s3_idx = _G["s1n"], _G["s2_idx"], _G["s3_idx"]
+    cands, clf = _G["cands"], _G["clf"]
     name_mat, addr_mat, idx = _G["name_mat"], _G["addr_mat"], _G["idx"]
     out = {}
     for a in s1n.iloc[start:end].itertuples(index=False):
         s1 = a.entity_id
-        ids = [c for c in cands.get(s1, []) if c in by_id.index]
+        rows, cids = [], []
+        for cid in cands.get(s1, []):
+            b = _lookup_b(cid, s2_idx, s3_idx)
+            if b is None:
+                continue
+            rows.append(pair_features(a, b, name_mat, addr_mat, idx))
+            cids.append(cid)
         scored = []
-        if ids:
-            X = pd.DataFrame([pair_features(a, by_id.loc[c], name_mat, addr_mat, idx)
-                              for c in ids])[feature_columns()]
+        if rows:
+            X = pd.DataFrame(rows)[feature_columns()]
             p = clf.predict_proba(X)[:, 1]
-            scored = sorted(zip(p.tolist(), ids), reverse=True)
+            scored = sorted(zip(p.tolist(), cids), reverse=True)
         out[s1] = scored
     return out
 
 
-def score_pairs(s1n, by_id_df, cands, clf, name_mat, addr_mat, idx,
+def score_pairs(s1n, s2n, s3n, cands, clf, name_mat, addr_mat, idx,
                 n_jobs=None, chunk_size=200_000) -> dict[str, list[tuple[float, str]]]:
+    s2_idx = s2n.set_index("entity_id", drop=False)
+    s3_idx = s3n.set_index("entity_id", drop=False)
     n_jobs = n_jobs or os.cpu_count() or 1
     ctx = _ctx()
     n = len(s1n)
@@ -63,13 +80,13 @@ def score_pairs(s1n, by_id_df, cands, clf, name_mat, addr_mat, idx,
         ranges = list(_chunks_idx(n, chunk_size))
         out: dict[str, list[tuple[float, str]]] = {}
         with ctx.Pool(n_jobs, initializer=_pool_init,
-                       initargs=(s1n, by_id_df, cands, clf, name_mat, addr_mat, idx)) as pool:
+                       initargs=(s1n, s2_idx, s3_idx, cands, clf, name_mat, addr_mat, idx)) as pool:
             for part in pool.imap_unordered(_score_range, ranges):
                 out.update(part)
                 del part
         return out
 
-    _pool_init(s1n, by_id_df, cands, clf, name_mat, addr_mat, idx)
+    _pool_init(s1n, s2_idx, s3_idx, cands, clf, name_mat, addr_mat, idx)
     return _score_range((0, n))
 
 
