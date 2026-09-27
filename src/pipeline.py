@@ -1,3 +1,4 @@
+%%writefile src/pipeline.py
 """Orchestrator: prep -> block -> featurize -> train -> predict -> validate -> package."""
 from __future__ import annotations
 import os
@@ -79,19 +80,27 @@ def _read_cached(cfg, name):
 
 
 def stage_block(cfg):
+    # Train and test are processed one at a time (load -> build_candidates -> free)
+    # instead of holding all four large frames (~21M+ rows combined) in memory at
+    # once. Same principle as stage_prep's sequential train/test handling.
     s1n = _read_cached(cfg, "train_s1")
-    te1 = _read_cached(cfg, "test_s1")
     tr_others = pd.concat([_read_cached(cfg, "train_s2"), _read_cached(cfg, "train_s3")],
                           ignore_index=True)
+    print(f"[block] building train candidates ({len(s1n)} x {len(tr_others)}) ...")
+    tr_cands = bl.build_candidates(s1n, tr_others, cfg["blocking"])
+    json.dump(tr_cands, open(_cache(cfg, "train_cands.json"), "w"))
+    del s1n, tr_others, tr_cands
+
+    te1 = _read_cached(cfg, "test_s1")
     te_others = pd.concat([_read_cached(cfg, "test_s2"), _read_cached(cfg, "test_s3")],
                           ignore_index=True)
-    tr_cands = bl.build_candidates(s1n, tr_others, cfg["blocking"])
+    print(f"[block] building test candidates ({len(te1)} x {len(te_others)}) ...")
     te_cands = bl.build_candidates(te1, te_others, cfg["blocking"])
-    json.dump(tr_cands, open(_cache(cfg, "train_cands.json"), "w"))
     json.dump(te_cands, open(_cache(cfg, "test_cands.json"), "w"))
     io.write_candidates(os.path.join(cfg["paths"]["output_dir"], "candidate_pairs.tsv"), te_cands)
     avg = np.mean([len(v) for v in te_cands.values()])
     print(f"[block] test candidates/entity avg={avg:.1f}  wrote candidate_pairs.tsv")
+    del te1, te_others, te_cands
 
 
 def stage_featurize(cfg):
